@@ -90,9 +90,9 @@ function Convert-RepositoryUri {
 
     process {
         # https://git-scm.com/docs/git-clone#_git_urls
-        # https://regex101.com/r/xGmwRr/1
-        if ($Uri -match '(?:@|/{1,3})(?:www\.|.*@)?(?<provider>[^/]+?)(?::\d+)?[:/](?<user>.+)/(?<repo>.+?)(?:\.git)?/?$') {
-            $Matches.provider, $Matches.user, $Matches.repo -join '/'
+        # https://regex101.com/r/CBSY2h/2
+        if ($Uri -match '(?:@|/{1,3})(?:www\.|.*@)?(?<provider>[^/]+?)(?::\d+)?[:/](?:(?<user>.+)/)?(?<repo>.+?)(?:\.git)?/?$') {
+            ($Matches.provider, $Matches.user, $Matches.repo | ? { $_ }) -join '/'
         } else {
             error "$Uri is not a valid Git URL!"
             error "Please see https://git-scm.com/docs/git-clone#_git_urls for valid ones."
