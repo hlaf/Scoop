@@ -216,6 +216,16 @@ function Complete-ConfigChange {
             }
         }
     }
+
+    if ($Name -eq 'use_sqlite_cache' -and $Value -eq $true) {
+        if ((Get-DefaultArchitecture) -eq 'arm64') {
+            abort 'SQLite cache is not supported on ARM64 platform.'
+        }
+        . "$PSScriptRoot\..\lib\database.ps1"
+        . "$PSScriptRoot\..\lib\manifest.ps1"
+        info 'Initializing SQLite cache in progress... This may take a while, please wait.'
+        Set-ScoopDB
+    }
 }
 
 function setup_proxy() {
@@ -314,10 +324,6 @@ function Invoke-GitLog {
 # helper functions
 function coalesce($a, $b) { if($a) { return $a } $b }
 
-function format($str, $hash) {
-    $hash.keys | ForEach-Object { set-variable $_ $hash[$_] }
-    $executionContext.invokeCommand.expandString($str)
-}
 function is_admin {
     $admin = [security.principal.windowsbuiltinrole]::administrator
     $id = [security.principal.windowsidentity]::getcurrent()
@@ -399,7 +405,22 @@ function currentdir($app, $global) {
 function persistdir($app, $global) { "$(basedir $global)\persist\$app" }
 function usermanifestsdir { "$(basedir)\workspace" }
 function usermanifest($app) { "$(usermanifestsdir)\$app.json" }
-function cache_path($app, $version, $url) { "$cachedir\$app#$version#$($url -replace '[^\w\.\-]+', '_')" }
+function cache_path($app, $version, $url) {
+    $underscoredUrl = $url -replace '[^\w\.\-]+', '_'
+    $filePath = Join-Path $cachedir "$app#$version#$underscoredUrl"
+
+    # NOTE: Scoop cache files migration. Remove this 6 months after the feature ships.
+    if (Test-Path $filePath) {
+        return $filePath
+    }
+
+    $urlStream = [System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes($url))
+    $sha = (Get-FileHash -Algorithm SHA256 -InputStream $urlStream).Hash.ToLower().Substring(0, 7)
+    $extension = [System.IO.Path]::GetExtension($url)
+    $filePath = $filePath -replace "$underscoredUrl", "$sha$extension"
+
+    return $filePath
+}
 
 # apps
 function sanitary_path($path) { return [regex]::replace($path, "[/\\?:*<>|]", "") }
@@ -477,7 +498,7 @@ function Get-HelperPath {
     [OutputType([String])]
     param(
         [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
-        [ValidateSet('Git', '7zip', 'Lessmsi', 'Innounp', 'Dark', 'Aria2', 'Zstd')]
+        [ValidateSet('Git', '7zip', 'Lessmsi', 'Innounp', 'Dark', 'Aria2')]
         [String]
         $Helper
     )
@@ -491,12 +512,17 @@ function Get-HelperPath {
                 if ($internalgit) {
                     $HelperPath = $internalgit
                 } else {
-                    $HelperPath = (Get-Command git -ErrorAction Ignore).Source
+                    $HelperPath = (Get-Command git -CommandType Application -TotalCount 1 -ErrorAction Ignore).Source
                 }
             }
             '7zip' { $HelperPath = Get-AppFilePath '7zip' '7z.exe' }
             'Lessmsi' { $HelperPath = Get-AppFilePath 'lessmsi' 'lessmsi.exe' }
-            'Innounp' { $HelperPath = Get-AppFilePath 'innounp' 'innounp.exe' }
+            'Innounp' {
+                $HelperPath = Get-AppFilePath 'innounp-unicode' 'innounp.exe'
+                if ([String]::IsNullOrEmpty($HelperPath)) {
+                    $HelperPath = Get-AppFilePath 'innounp' 'innounp.exe'
+                }
+            }
             'Dark' {
                 $HelperPath = Get-AppFilePath 'wixtoolset' 'wix.exe'
                 if ([String]::IsNullOrEmpty($HelperPath)) {
@@ -504,7 +530,6 @@ function Get-HelperPath {
                 }
             }
             'Aria2' { $HelperPath = Get-AppFilePath 'aria2' 'aria2c.exe' }
-            'Zstd' { $HelperPath = Get-AppFilePath 'zstd' 'zstd.exe' }
         }
 
         return $HelperPath
@@ -551,7 +576,7 @@ function Test-HelperInstalled {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true, Position = 0, ValueFromPipeline = $true)]
-        [ValidateSet('7zip', 'Lessmsi', 'Innounp', 'Dark', 'Aria2', 'Zstd')]
+        [ValidateSet('7zip', 'Lessmsi', 'Innounp', 'Dark', 'Aria2')]
         [String]
         $Helper
     )
@@ -746,31 +771,35 @@ function Invoke-ExternalCommand {
         $Process.StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     }
     if ($ArgumentList.Length -gt 0) {
-        $ArgumentList = $ArgumentList | ForEach-Object { [regex]::Split($_.Replace('"', ''), '(?<=(?<![:\w])[/-]\w+) | (?=[/-])') }
-        # Use legacy argument escaping for commands having non-standard behavior
-        # with regard to argument passing. `msiexec` requires some args like
-        # `TARGETDIR="C:\Program Files"`, which is non-standard, therefore we
-        # treat it as a legacy command.
+        # Remove existing double quotes and split arguments
+        # '(?<=(?<![:\w])[/-]\w+) ' matches a space after a command line switch starting with a slash ('/') or a hyphen ('-')
+        # The inner item '(?<![:\w])[/-]' matches a slash ('/') or a hyphen ('-') not preceded by a colon (':') or a word character ('\w')
+        # so that it must be a command line switch, otherwise, it would be a path (e.g. 'C:/Program Files') or other word (e.g. 'some-arg')
+        # ' (?=[/-])' matches a space followed by a slash ('/') or a hyphen ('-'), i.e. the space before a command line switch
+        $ArgumentList = $ArgumentList.ForEach({ $_ -replace '"' -split '(?<=(?<![:\w])[/-]\w+) | (?=[/-])' })
+        # Use legacy argument escaping for commands having non-standard behavior with regard to argument passing.
+        # `msiexec` requires some args like `TARGETDIR="C:\Program Files"`, which is non-standard, therefore we treat it as a legacy command.
+        # NSIS installer's '/D' param may not work with the ArgumentList property, so we need to escape arguments manually.
         # ref-1: https://learn.microsoft.com/en-us/powershell/scripting/learn/experimental-features?view=powershell-7.4#psnativecommandargumentpassing
-        $LegacyCommand = $FilePath -match '^((cmd|cscript|find|sqlcmd|wscript|msiexec)(\.exe)?|.*\.(bat|cmd|js|vbs|wsf))$'
+        # ref-2: https://nsis.sourceforge.io/Docs/Chapter3.html
+        $LegacyCommand = $FilePath -match '^((cmd|cscript|find|sqlcmd|wscript|msiexec)(\.exe)?|.*\.(bat|cmd|js|vbs|wsf))$' -or
+            ($ArgumentList -match '^/S$|^/D=[A-Z]:[\\/].*$').Length -eq 2
         $SupportArgumentList = $Process.StartInfo.PSObject.Properties.Name -contains 'ArgumentList'
         if ((-not $LegacyCommand) -and $SupportArgumentList) {
             # ArgumentList is supported in PowerShell 6.1 and later (built on .NET Core 2.1+)
             # ref-1: https://docs.microsoft.com/en-us/dotnet/api/system.diagnostics.processstartinfo.argumentlist?view=net-6.0
             # ref-2: https://docs.microsoft.com/en-us/powershell/scripting/whats-new/differences-from-windows-powershell?view=powershell-7.2#net-framework-vs-net-core
-            $ArgumentList | ForEach-Object { $Process.StartInfo.ArgumentList.Add($_) }
+            $ArgumentList.ForEach({ $Process.StartInfo.ArgumentList.Add($_) })
         } else {
-            # escape arguments manually in lower versions, refer to https://docs.microsoft.com/en-us/previous-versions/17w5ykft(v=vs.85)
-            $escapedArgs = $ArgumentList | ForEach-Object {
-                # escape N consecutive backslash(es), which are followed by a double quote or at the end of the string, to 2N consecutive ones
-                $s = $_ -replace '(\\+)(""|$)', '$1$1$2'
-                # quote the path if it contains spaces and is not NSIS's '/D' argument
-                # ref: https://nsis.sourceforge.io/Docs/Chapter3.html
-                if ($s -match ' ' -and $s -notmatch '/D=[A-Z]:[\\/].*') {
-                    $s -replace '([A-Z]:[\\/].*)', '"$1"'
-                } else {
-                    $s
-                }
+            # Escape arguments manually in lower versions
+            $escapedArgs = switch -regex ($ArgumentList) {
+                # Quote paths starting with a drive letter
+                '(?<!/D=)[A-Z]:[\\/].*' { $_ -replace '([A-Z]:[\\/].*)', '"$1"'; continue }
+                # Do not quote paths if it is NSIS's '/D' argument
+                '/D=[A-Z]:[\\/].*' { $_; continue }
+                # Quote args with spaces
+                ' ' { "`"$_`""; continue }
+                default { $_; continue }
             }
             $Process.StartInfo.Arguments = $escapedArgs -join ' '
         }
@@ -1009,19 +1038,20 @@ function shim($path, $global, $name, $arg) {
         warn_on_overwrite "$shim.cmd" $path
         @(
             "@rem $resolved_path",
-            "@cd /d $(Split-Path $resolved_path -Parent)"
-            "@java -jar `"$resolved_path`" $arg %*"
+            "@pushd $(Split-Path $resolved_path -Parent)",
+            "@java -jar `"$resolved_path`" $arg %*",
+            "@popd"
         ) -join "`r`n" | Out-UTF8File "$shim.cmd"
 
         warn_on_overwrite $shim $path
         @(
             "#!/bin/sh",
             "# $resolved_path",
-            "if [ `$(echo `$WSL_DISTRO_NAME) ]",
+            "if [ `$WSL_INTEROP ]",
             'then',
             "  cd `$(wslpath -u '$(Split-Path $resolved_path -Parent)')",
             'else',
-            "  cd `"$((Split-Path $resolved_path -Parent).Replace('\', '/'))`"",
+            "  cd `$(cygpath -u '$(Split-Path $resolved_path -Parent)')",
             'fi',
             "java.exe -jar `"$resolved_path`" $arg `"$@`""
         ) -join "`n" | Out-UTF8File $shim -NoNewLine
@@ -1034,7 +1064,7 @@ function shim($path, $global, $name, $arg) {
 
         warn_on_overwrite $shim $path
         @(
-            "#!/bin/sh",
+            '#!/bin/sh',
             "# $resolved_path",
             "python.exe `"$resolved_path`" $arg `"$@`""
         ) -join "`n" | Out-UTF8File $shim -NoNewLine
@@ -1042,14 +1072,22 @@ function shim($path, $global, $name, $arg) {
         warn_on_overwrite "$shim.cmd" $path
         @(
             "@rem $resolved_path",
-            "@bash `"$resolved_path`" $arg %*"
+            "@bash `"`$(wslpath -u '$resolved_path')`" $arg %* 2>nul",
+            '@if %errorlevel% neq 0 (',
+            "  @bash `"`$(cygpath -u '$resolved_path')`" $arg %* 2>nul",
+            ')'
         ) -join "`r`n" | Out-UTF8File "$shim.cmd"
 
         warn_on_overwrite $shim $path
         @(
-            "#!/bin/sh",
+            '#!/bin/sh',
             "# $resolved_path",
-            "`"$resolved_path`" $arg `"$@`""
+            "if [ `$WSL_INTEROP ]",
+            'then',
+            "  `"`$(wslpath -u '$resolved_path')`" $arg `"$@`"",
+            'else',
+            "  `"`$(cygpath -u '$resolved_path')`" $arg `"$@`"",
+            'fi'
         ) -join "`n" | Out-UTF8File $shim -NoNewLine
     }
 }
@@ -1168,7 +1206,7 @@ function applist($apps, $global) {
 }
 
 function parse_app([string]$app) {
-    if ($app -match '^(?:(?<bucket>[a-zA-Z0-9-_.]+)/)?(?<app>.*\.json$|[a-zA-Z0-9-_.]+)(?:@(?<version>.*))?$') {
+    if ($app -match '^(?:(?<bucket>[a-zA-Z0-9-_.]+)/)?(?<app>.*\.json|[a-zA-Z0-9-_.]+)(?:@(?<version>.*))?$') {
         return $Matches['app'], $Matches['bucket'], $Matches['version']
     } else {
         return $app, $null, $null
@@ -1221,8 +1259,8 @@ function Test-ScoopCoreOnHold() {
 }
 
 function substitute($entity, [Hashtable] $params, [Bool]$regexEscape = $false) {
-    $newentity = $entity
-    if ($null -ne $newentity) {
+    if ($null -ne $entity) {
+        $newentity = $entity.PSObject.Copy()
         switch ($entity.GetType().Name) {
             'String' {
                 $params.GetEnumerator() | ForEach-Object {
@@ -1234,7 +1272,7 @@ function substitute($entity, [Hashtable] $params, [Bool]$regexEscape = $false) {
                 }
             }
             'Object[]' {
-                $newentity = $entity | ForEach-Object { ,(substitute $_ $params $regexEscape) }
+                $newentity = $entity | ForEach-Object { , (substitute $_ $params $regexEscape) }
             }
             'PSCustomObject' {
                 $newentity.PSObject.Properties | ForEach-Object { $_.Value = substitute $_.Value $params $regexEscape }
